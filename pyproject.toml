@@ -17,6 +17,9 @@ mangaocr = ["manga-ocr>=0.1.10"]
 deepl = ["deepl>=1.16"]
 openai = ["openai>=1.0"]
 argos = ["argostranslate>=1.9"]
+snippets = ["pillow>=10.0"]
+encrypt = ["cryptography>=42.0"]
+macos = ["pyobjc-framework-Cocoa>=10.0", "pyobjc-framework-Quartz>=10.0"]
 
 [project.scripts]
 lang-view = "lang_view.__main__:main"
