@@ -1,0 +1,20 @@
+[project]
+name = "lang-view"
+version = "0.1.0"
+description = "Watch the screen and log Korean/Japanese text via OCR."
+requires-python = ">=3.10"
+dependencies = [
+    "easyocr>=1.7.0",
+    "mss>=9.0.0",
+    "numpy>=1.24",
+]
+
+[project.scripts]
+lang-view = "lang_view.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["lang_view"]
