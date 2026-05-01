@@ -1,55 +1,59 @@
 import argparse
 import json
+import logging
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-import easyocr
-import mss
-import numpy as np
+from .dedup import TimeWindowDedup
+from .frames import frame_signature, to_xywh
+from .text_filter import classify
+
+log = logging.getLogger("lang_view")
 
 
-HANGUL_RANGES = [(0xAC00, 0xD7AF), (0x1100, 0x11FF), (0x3130, 0x318F)]
-KANA_RANGES = [(0x3040, 0x309F), (0x30A0, 0x30FF)]
-CJK_IDEOGRAPH_RANGES = [(0x4E00, 0x9FFF), (0x3400, 0x4DBF)]
+def _build_readers(lang, gpu):
+    import easyocr  # heavy import, defer until run-time
+
+    readers = []
+    if lang in ("ko", "both"):
+        readers.append(("ko", easyocr.Reader(["ko", "en"], gpu=gpu, verbose=False)))
+    if lang in ("ja", "both"):
+        readers.append(("ja", easyocr.Reader(["ja", "en"], gpu=gpu, verbose=False)))
+    return readers
 
 
-def _in_ranges(ch, ranges):
-    code = ord(ch)
-    return any(lo <= code <= hi for lo, hi in ranges)
+def _grab(sct, monitor_index):
+    import numpy as np
 
-
-def has_hangul(text):
-    return any(_in_ranges(c, HANGUL_RANGES) for c in text)
-
-
-def has_kana(text):
-    return any(_in_ranges(c, KANA_RANGES) for c in text)
-
-
-def has_cjk_ideograph(text):
-    return any(_in_ranges(c, CJK_IDEOGRAPH_RANGES) for c in text)
-
-
-def classify(text, hint):
-    """Return 'ko', 'ja', or None. `hint` resolves ideograph-only text."""
-    if has_hangul(text):
-        return "ko"
-    if has_kana(text):
-        return "ja"
-    if has_cjk_ideograph(text):
-        return hint
-    return None
-
-
-def grab_screen(sct, monitor_index):
     monitor = sct.monitors[monitor_index]
     img = np.array(sct.grab(monitor))
     return img[:, :, :3]
 
 
-def main():
+def _process_detection(detection, hint, min_confidence, dedup):
+    bbox, text, conf = detection
+    if conf < min_confidence:
+        return None
+    text = text.strip()
+    if not text:
+        return None
+    lang = classify(text, hint)
+    if lang is None:
+        return None
+    if not dedup.check_and_add(f"{lang}\t{text}"):
+        return None
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "lang": lang,
+        "text": text,
+        "confidence": round(float(conf), 3),
+        "bbox": to_xywh(bbox),
+    }
+
+
+def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Watch the screen and log any Korean or Japanese text it shows."
     )
@@ -59,71 +63,71 @@ def main():
                         help="Output JSONL file (default: captures.jsonl)")
     parser.add_argument("--monitor", type=int, default=1,
                         help="Monitor index, 1 = primary, 0 = all combined (default: 1)")
+    parser.add_argument("--lang", choices=("ko", "ja", "both"), default="both",
+                        help="Which language(s) to OCR (default: both)")
     parser.add_argument("--gpu", action="store_true",
                         help="Use GPU for OCR if available")
     parser.add_argument("--min-confidence", type=float, default=0.4,
                         help="Drop OCR results below this confidence (default: 0.4)")
-    args = parser.parse_args()
+    parser.add_argument("--dedup-seconds", type=float, default=60.0,
+                        help="Suppress identical text seen within this window (default: 60)")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Log every detection to stderr")
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        stream=sys.stderr,
+    )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
-    print("Loading EasyOCR readers (Korean + Japanese). First run downloads models (~100MB).",
-          file=sys.stderr)
-    ko_reader = easyocr.Reader(["ko", "en"], gpu=args.gpu, verbose=False)
-    ja_reader = easyocr.Reader(["ja", "en"], gpu=args.gpu, verbose=False)
-    readers = [("ko", ko_reader), ("ja", ja_reader)]
+    log.info("Loading EasyOCR (%s). First run downloads ~100MB of models.", args.lang)
+    readers = _build_readers(args.lang, args.gpu)
 
-    seen = set()
-    seen_order = []
-    dedup_window = 500
+    import mss  # defer until after readers loaded so the user sees model download first
 
-    print(f"Watching screen every {args.interval}s. Logging to {args.output}. Ctrl+C to stop.",
-          file=sys.stderr)
-    print("On macOS, grant Screen Recording permission to your terminal in "
-          "System Settings > Privacy & Security.", file=sys.stderr)
+    dedup = TimeWindowDedup(args.dedup_seconds)
+    last_sig = None
+    skipped_unchanged = 0
+
+    log.info("Watching every %.2fs -> %s. Ctrl+C to stop.", args.interval, args.output)
+    log.info("On macOS, grant Screen Recording permission to your terminal.")
 
     with mss.mss() as sct, args.output.open("a", encoding="utf-8") as out:
         while True:
             cycle_start = time.monotonic()
             try:
-                frame = grab_screen(sct, args.monitor)
+                frame = _grab(sct, args.monitor)
             except Exception as e:
-                print(f"Capture error: {e}", file=sys.stderr)
+                log.warning("Capture error: %s", e)
                 time.sleep(args.interval)
                 continue
+
+            sig = frame_signature(frame)
+            if sig == last_sig:
+                skipped_unchanged += 1
+                if skipped_unchanged % 30 == 0:
+                    log.debug("Skipped %d unchanged frames", skipped_unchanged)
+                time.sleep(max(0.0, args.interval - (time.monotonic() - cycle_start)))
+                continue
+            last_sig = sig
+            skipped_unchanged = 0
 
             for hint, reader in readers:
                 try:
                     detections = reader.readtext(frame)
                 except Exception as e:
-                    print(f"OCR error ({hint}): {e}", file=sys.stderr)
+                    log.warning("OCR error (%s): %s", hint, e)
                     continue
-                for bbox, text, conf in detections:
-                    if conf < args.min_confidence:
+                for det in detections:
+                    record = _process_detection(det, hint, args.min_confidence, dedup)
+                    if record is None:
                         continue
-                    text = text.strip()
-                    if not text:
-                        continue
-                    lang = classify(text, hint)
-                    if lang is None:
-                        continue
-                    key = f"{lang}\t{text}"
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    seen_order.append(key)
-                    if len(seen_order) > dedup_window:
-                        seen.discard(seen_order.pop(0))
-                    record = {
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "lang": lang,
-                        "text": text,
-                        "confidence": round(float(conf), 3),
-                        "bbox": [[int(x), int(y)] for x, y in bbox],
-                    }
                     out.write(json.dumps(record, ensure_ascii=False) + "\n")
                     out.flush()
-                    print(f"[{lang}] {text}", file=sys.stderr)
+                    log.info("[%s] %s", record["lang"], record["text"])
 
             elapsed = time.monotonic() - cycle_start
             time.sleep(max(0.0, args.interval - elapsed))
@@ -133,5 +137,5 @@ if __name__ == "__main__":
     try:
         sys.exit(main() or 0)
     except KeyboardInterrupt:
-        print("\nStopped.", file=sys.stderr)
+        log.info("Stopped.")
         sys.exit(0)

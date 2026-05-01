@@ -9,6 +9,9 @@ dependencies = [
     "numpy>=1.24",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
 [project.scripts]
 lang-view = "lang_view.__main__:main"
 
