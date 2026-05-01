@@ -35,13 +35,6 @@ CREATE TABLE IF NOT EXISTS captures (
 
 CREATE INDEX IF NOT EXISTS captures_lang_ts ON captures(lang, timestamp);
 CREATE INDEX IF NOT EXISTS captures_text    ON captures(text);
-
-CREATE VIRTUAL TABLE IF NOT EXISTS captures_fts
-    USING fts5(text, lang UNINDEXED, content='captures', content_rowid='id');
-
-CREATE TRIGGER IF NOT EXISTS captures_ai AFTER INSERT ON captures BEGIN
-    INSERT INTO captures_fts(rowid, text, lang) VALUES (new.id, new.text, new.lang);
-END;
 """
 
 
@@ -75,14 +68,20 @@ class Storage:
             )
 
     def search(self, query, *, lang=None, limit=50):
-        sql = ("SELECT c.* FROM captures c "
-               "JOIN captures_fts f ON f.rowid = c.id "
-               "WHERE captures_fts MATCH ?")
-        params = [query]
+        """Case-insensitive substring search.
+
+        We deliberately use LIKE rather than FTS5: CJK text contains no
+        whitespace tokenization boundaries, so the default FTS5
+        tokenizer treats whole sentences as single tokens and refuses
+        to match prefixes like "안녕" inside "안녕하세요".
+        """
+        like = f"%{_escape_like(query)}%"
+        sql = "SELECT * FROM captures WHERE text LIKE ? ESCAPE '\\'"
+        params = [like]
         if lang:
-            sql += " AND c.lang = ?"
+            sql += " AND lang = ?"
             params.append(lang)
-        sql += " ORDER BY c.timestamp DESC LIMIT ?"
+        sql += " ORDER BY timestamp DESC LIMIT ?"
         params.append(int(limit))
         with closing(self._conn.execute(sql, params)) as cur:
             return [_row_to_record(r) for r in cur.fetchall()]
@@ -120,6 +119,13 @@ class Storage:
 
     def __exit__(self, *exc):
         self.close()
+
+
+def _escape_like(query):
+    """Escape `%`, `_`, and `\\` for use inside a LIKE pattern."""
+    return (query.replace("\\", "\\\\")
+                  .replace("%", "\\%")
+                  .replace("_", "\\_"))
 
 
 def _row_to_record(row):

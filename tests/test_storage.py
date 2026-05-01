@@ -85,3 +85,25 @@ def test_all_filters_by_lang(tmp_path):
         ko_only = s.all(lang="ko")
     assert len(ko_only) == 1
     assert ko_only[0]["lang"] == "ko"
+
+
+def test_search_finds_cjk_substrings(tmp_path):
+    """CJK has no whitespace, so substring search must work without it."""
+    with Storage(tmp_path / "db.sqlite") as s:
+        s.write(_record(text="안녕하세요", lang="ko"))
+        s.write(_record(text="今日は良い天気です", lang="ja"))
+        ko = s.search("안녕")
+        ja = s.search("天気")
+    assert len(ko) == 1 and ko[0]["text"] == "안녕하세요"
+    assert len(ja) == 1 and "天気" in ja[0]["text"]
+
+
+def test_search_handles_special_chars_safely(tmp_path):
+    """LIKE wildcards from user input must not match unrelated rows."""
+    with Storage(tmp_path / "db.sqlite") as s:
+        s.write(_record(text="100% safe", lang="ko"))
+        s.write(_record(text="totally unrelated", lang="ko"))
+        # The literal '%' should match only the first row, not act as wildcard.
+        results = s.search("100% safe")
+    assert len(results) == 1
+    assert results[0]["text"] == "100% safe"
