@@ -322,6 +322,68 @@ def cmd_keygen(args):
     print(generate_key())
 
 
+def cmd_install_agent(args):
+    from .launchd import (
+        DEFAULT_LABEL,
+        default_agent_path,
+        install_agent,
+        is_launchctl_available,
+        render_plist,
+        write_agent,
+    )
+    program_args = [sys.executable, "-m", "lang_view", "watch"]
+    if args.db:
+        program_args += ["--db", str(args.db)]
+    if args.output:
+        program_args += ["--output", str(args.output)]
+    raw = render_plist(
+        label=args.label,
+        program_args=program_args,
+        working_dir=str(Path.home()),
+        stdout_path=str(args.log) if args.log else None,
+        stderr_path=str(args.log) if args.log else None,
+    )
+    plist_path = args.plist or default_agent_path(args.label)
+    write_agent(plist_path, raw)
+    log.info("Wrote agent plist to %s", plist_path)
+    if not is_launchctl_available():
+        log.warning("launchctl not found; the plist was written but not loaded.")
+        return
+    install_agent(plist_path)
+    log.info("Loaded LaunchAgent %s", args.label)
+
+
+def cmd_uninstall_agent(args):
+    from .launchd import (
+        is_launchctl_available,
+        uninstall_agent,
+    )
+    if not is_launchctl_available():
+        log.warning("launchctl not found; remove the plist manually.")
+        return
+    uninstall_agent(label=args.label)
+    log.info("Uninstalled LaunchAgent %s", args.label)
+
+
+def cmd_dashboard(args):
+    from .dashboard import create_app
+    app = create_app(args.db)
+    log.info("Serving dashboard for %s on http://%s:%d",
+             args.db, args.host, args.port)
+    app.run(host=args.host, port=args.port, debug=False)
+
+
+def cmd_menubar(args):
+    from .menubar import MenubarApp, MenubarState
+    state = MenubarState()
+    if args.recent:
+        from .storage import Storage
+        with Storage(args.recent) as s:
+            for record in s.all(limit=20):
+                state.append(record)
+    MenubarApp(state).run()
+
+
 def _iter_jsonl(path, cipher=None):
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
@@ -421,6 +483,37 @@ def main(argv=None):
     keygen = sub.add_parser("keygen", help="Print a fresh Fernet encryption key.")
     keygen.add_argument("--verbose", "-v", action="store_true")
 
+    install = sub.add_parser("install-agent",
+                             help="Install a launchd LaunchAgent (macOS).")
+    install.add_argument("--label", default="ai.lang-view.watcher")
+    install.add_argument("--plist", type=Path, default=None,
+                         help="Path to write the plist (default: ~/Library/LaunchAgents/<label>.plist)")
+    install.add_argument("--db", type=Path, default=None,
+                         help="SQLite DB to pass to the watch command")
+    install.add_argument("--output", type=Path, default=None,
+                         help="JSONL output to pass to the watch command")
+    install.add_argument("--log", type=Path, default=None,
+                         help="stdout/stderr log file for the agent")
+    install.add_argument("--verbose", "-v", action="store_true")
+
+    uninstall = sub.add_parser("uninstall-agent",
+                               help="Unload and remove the LaunchAgent (macOS).")
+    uninstall.add_argument("--label", default="ai.lang-view.watcher")
+    uninstall.add_argument("--verbose", "-v", action="store_true")
+
+    dashboard = sub.add_parser("dashboard",
+                               help="Serve a small web UI for the SQLite store.")
+    dashboard.add_argument("--db", type=Path, required=True)
+    dashboard.add_argument("--host", default="127.0.0.1")
+    dashboard.add_argument("--port", type=int, default=7321)
+    dashboard.add_argument("--verbose", "-v", action="store_true")
+
+    menubar = sub.add_parser("menubar",
+                             help="Run the macOS menubar app (rumps).")
+    menubar.add_argument("--recent", type=Path, default=None,
+                         help="Seed the recent list from this SQLite DB")
+    menubar.add_argument("--verbose", "-v", action="store_true")
+
     if argv is None:
         argv = sys.argv[1:]
     if not argv or (argv[0].startswith("-") and argv[0] not in ("-h", "--help")):
@@ -441,6 +534,10 @@ def main(argv=None):
         "stats": cmd_stats,
         "export": cmd_export,
         "keygen": cmd_keygen,
+        "install-agent": cmd_install_agent,
+        "uninstall-agent": cmd_uninstall_agent,
+        "dashboard": cmd_dashboard,
+        "menubar": cmd_menubar,
     }
     handler = handlers.get(args.command)
     if handler is None:

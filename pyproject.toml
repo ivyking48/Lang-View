@@ -20,6 +20,8 @@ argos = ["argostranslate>=1.9"]
 snippets = ["pillow>=10.0"]
 encrypt = ["cryptography>=42.0"]
 macos = ["pyobjc-framework-Cocoa>=10.0", "pyobjc-framework-Quartz>=10.0"]
+menubar = ["rumps>=0.4"]
+dashboard = ["flask>=3.0"]
 
 [project.scripts]
 lang-view = "lang_view.__main__:main"
