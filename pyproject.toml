@@ -11,6 +11,12 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
+kana = ["pykakasi>=2.2"]
+romaja = ["hangul-romanize>=0.1.0"]
+mangaocr = ["manga-ocr>=0.1.10"]
+deepl = ["deepl>=1.16"]
+openai = ["openai>=1.0"]
+argos = ["argostranslate>=1.9"]
 
 [project.scripts]
 lang-view = "lang_view.__main__:main"
@@ -20,4 +26,4 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["lang_view"]
+packages = ["lang_view", "lang_view.enrich"]
