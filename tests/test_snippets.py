@@ -3,7 +3,7 @@ import pytest
 
 pytest.importorskip("PIL")
 
-from lang_view.snippets import SnippetWriter
+from lang_view.snippets import FrameWriter, SnippetWriter
 
 
 def _frame(shape=(100, 200, 3)):
@@ -45,3 +45,37 @@ def test_label_is_sanitised(tmp_path):
     name = path.split("/")[-1]
     suffix = name.split("_", 1)[-1].rsplit(".", 1)[0]
     assert all(c.isalnum() or c == "_" for c in suffix)
+
+
+def test_frame_writer_saves_png(tmp_path):
+    writer = FrameWriter(tmp_path, min_interval_seconds=0)
+    path = writer.write(_frame())
+    assert path is not None
+    from pathlib import Path
+    assert Path(path).exists()
+    assert Path(path).suffix == ".png"
+
+
+def test_frame_writer_dedupes_within_min_interval(tmp_path):
+    writer = FrameWriter(tmp_path, min_interval_seconds=10)
+    p1 = writer.write(_frame())
+    p2 = writer.write(_frame())
+    assert p1 is not None
+    assert p2 is None  # debounced
+
+
+def test_frame_writer_writes_again_after_interval(tmp_path):
+    writer = FrameWriter(tmp_path, min_interval_seconds=0)
+    p1 = writer.write(_frame())
+    # Manually advance the debounce clock so we don't rely on real time.
+    writer._last_written = 0.0
+    p2 = writer.write(_frame())
+    assert p1 is not None and p2 is not None
+    assert p1 != p2
+
+
+def test_frame_writer_handles_empty_frame(tmp_path):
+    import numpy as np
+    writer = FrameWriter(tmp_path, min_interval_seconds=0)
+    empty = np.zeros((0, 0, 3), dtype=np.uint8)
+    assert writer.write(empty) is None

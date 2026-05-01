@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS captures (
     bbox_h      INTEGER NOT NULL,
     app         TEXT,
     snippet     TEXT,
+    frame       TEXT,
     enrichment  TEXT
 );
 
@@ -38,13 +39,25 @@ CREATE INDEX IF NOT EXISTS captures_text    ON captures(text);
 """
 
 
+def _migrate(conn):
+    """Add columns introduced after the initial schema.
+
+    Each ``ALTER TABLE ADD COLUMN`` runs only when the column is absent,
+    so opening an older DB silently catches it up.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(captures)")}
+    if "frame" not in cols:
+        conn.execute("ALTER TABLE captures ADD COLUMN frame TEXT")
+
+
 class Storage:
     def __init__(self, path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.path))
+        self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
+        _migrate(self._conn)
         self._conn.commit()
 
     def write(self, record):
@@ -55,14 +68,15 @@ class Storage:
                 """INSERT INTO captures
                    (timestamp, lang, text, confidence,
                     bbox_x, bbox_y, bbox_w, bbox_h,
-                    app, snippet, enrichment)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    app, snippet, frame, enrichment)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     record["timestamp"], record["lang"], record["text"],
                     float(record.get("confidence", 0.0)),
                     int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]),
                     record.get("app"),
                     record.get("snippet"),
+                    record.get("frame"),
                     json.dumps(enrichment, ensure_ascii=False) if enrichment else None,
                 ),
             )
@@ -142,6 +156,12 @@ def _row_to_record(row):
         record["app"] = row["app"]
     if row["snippet"] is not None:
         record["snippet"] = row["snippet"]
+    # ``frame`` was added later; older rows may not have the column populated.
+    try:
+        if row["frame"] is not None:
+            record["frame"] = row["frame"]
+    except (IndexError, KeyError):
+        pass
     if enrichment is not None:
         record["enrichment"] = enrichment
     return record

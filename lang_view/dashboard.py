@@ -72,11 +72,24 @@ def _row_to_html(record):
         extras.append(next(iter(translations.values())))
     extras_html = ("<br><small>" + " · ".join(_escape(e) for e in extras) + "</small>"
                    if extras else "")
+    artifact_links = []
+    frame = record.get("frame")
+    if frame:
+        artifact_links.append(
+            f"<a href='/artifact?path={_escape(frame)}' target='_blank'>frame</a>"
+        )
+    snippet = record.get("snippet")
+    if snippet:
+        artifact_links.append(
+            f"<a href='/artifact?path={_escape(snippet)}' target='_blank'>snippet</a>"
+        )
+    artifact_cell = " · ".join(artifact_links) if artifact_links else ""
     return (
         f"<tr>"
         f"<td class='ts'>{_escape(record.get('timestamp', ''))}</td>"
         f"<td class='lang'>{_escape(record.get('lang', ''))}</td>"
         f"<td>{_escape(record.get('text', ''))}{extras_html}</td>"
+        f"<td class='lang'>{artifact_cell}</td>"
         f"</tr>"
     )
 
@@ -86,12 +99,23 @@ def _escape(s):
             .replace(">", "&gt;").replace('"', "&quot;"))
 
 
-def create_app(db_path):
-    from flask import Flask, jsonify, request
+def create_app(db_path, artifact_roots=None):
+    """Flask app. ``artifact_roots`` whitelists directories under which
+    PNG snippet/frame paths may be served via ``/artifact``. Defaults to
+    the parent of ``db_path`` plus its ``frames`` and ``snippets``
+    subdirectories so the standard install layout works without config.
+    """
+    from flask import Flask, abort, jsonify, request, send_file
 
     db_path = Path(db_path)
+    if artifact_roots is None:
+        base = db_path.parent
+        artifact_roots = [base, base / "frames", base / "snippets"]
+    artifact_roots = [Path(r).resolve() for r in artifact_roots]
+
     app = Flask(__name__)
     app.config["DB_PATH"] = str(db_path)
+    app.config["ARTIFACT_ROOTS"] = artifact_roots
 
     @app.route("/")
     def index():
@@ -138,6 +162,26 @@ def create_app(db_path):
         limit = int(request.args.get("limit", 100))
         with Storage(app.config["DB_PATH"]) as s:
             return jsonify(s.frequencies(lang=lang, limit=limit))
+
+    @app.route("/artifact")
+    def artifact():
+        """Serve a snippet/frame PNG. The requested path must resolve under
+        one of the configured artifact roots — anything else is rejected
+        to prevent directory traversal."""
+        raw = request.args.get("path") or ""
+        if not raw:
+            abort(400)
+        try:
+            target = Path(raw).resolve(strict=True)
+        except (OSError, RuntimeError):
+            abort(404)
+        for root in app.config["ARTIFACT_ROOTS"]:
+            try:
+                target.relative_to(root)
+            except ValueError:
+                continue
+            return send_file(target)
+        abort(403)
 
     @app.route("/stats")
     def stats_html():

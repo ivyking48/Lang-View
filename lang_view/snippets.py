@@ -1,4 +1,8 @@
-"""Save a per-detection cropped PNG snippet of the OCR bbox."""
+"""Save a per-detection cropped PNG snippet of the OCR bbox.
+
+Also exposes ``FrameWriter`` for saving the full captured frame to disk
+when at least one detection on that frame is kept.
+"""
 
 import logging
 from datetime import datetime, timezone
@@ -7,6 +11,44 @@ from pathlib import Path
 from .frames import crop
 
 log = logging.getLogger(__name__)
+
+
+class FrameWriter:
+    """Save the full captured frame as a PNG, deduped by time.
+
+    The watch loop calls ``write(frame)`` from each engine's
+    ``on_detections`` callback. A short time-based debounce
+    (``min_interval_seconds``) ensures the frame is written only once
+    per cycle even when multiple engines run on the same frame.
+    """
+
+    def __init__(self, dest_dir, min_interval_seconds=0.1):
+        self.dest_dir = Path(dest_dir)
+        self.dest_dir.mkdir(parents=True, exist_ok=True)
+        self.min_interval = float(min_interval_seconds)
+        self._last_written = 0.0
+
+    def write(self, frame):
+        try:
+            from PIL import Image
+        except ImportError:
+            log.warning("Pillow not installed; skipping full-frame snapshot")
+            return None
+        import time
+        now = time.monotonic()
+        if now - self._last_written < self.min_interval:
+            return None
+        if frame is None or getattr(frame, "size", 0) == 0:
+            return None
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+        path = self.dest_dir / f"{timestamp}_frame.png"
+        try:
+            Image.fromarray(frame[:, :, ::-1]).save(path)  # BGR -> RGB
+        except Exception as e:
+            log.warning("Could not write frame %s: %s", path, e)
+            return None
+        self._last_written = now
+        return str(path)
 
 
 class SnippetWriter:

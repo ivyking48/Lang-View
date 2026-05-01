@@ -96,3 +96,75 @@ def test_enrichment_is_visible_on_index(client):
     response = client.get("/?q=%E4%BB%8A%E6%97%A5")
     assert "きょう".encode("utf-8") in response.data
     assert b"today" in response.data
+
+
+def test_artifact_route_serves_files_under_root(tmp_path):
+    """The /artifact route should serve a PNG that lives under one of the
+    configured artifact roots."""
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    target = frames_dir / "ok.png"
+    target.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 50)  # Minimal PNG-ish.
+
+    db_path = tmp_path / "x.sqlite"
+    with Storage(db_path) as s:
+        s.write({"timestamp": "2026-05-01T12:00:00+00:00", "lang": "ko",
+                 "text": "안녕", "confidence": 0.9, "bbox": [0, 0, 10, 10]})
+
+    app = create_app(db_path, artifact_roots=[frames_dir])
+    app.config["TESTING"] = True
+    c = app.test_client()
+    response = c.get(f"/artifact?path={target}")
+    assert response.status_code == 200
+    assert response.data.startswith(b"\x89PNG")
+
+
+def test_artifact_route_blocks_paths_outside_root(tmp_path):
+    """Anything not under an artifact root must be rejected."""
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(b"x")
+
+    db_path = tmp_path / "x.sqlite"
+    with Storage(db_path):
+        pass
+
+    app = create_app(db_path, artifact_roots=[frames_dir])
+    app.config["TESTING"] = True
+    c = app.test_client()
+    response = c.get(f"/artifact?path={outside}")
+    assert response.status_code == 403
+
+
+def test_artifact_route_returns_404_for_missing(tmp_path):
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+
+    db_path = tmp_path / "x.sqlite"
+    with Storage(db_path):
+        pass
+
+    app = create_app(db_path, artifact_roots=[frames_dir])
+    app.config["TESTING"] = True
+    c = app.test_client()
+    response = c.get(f"/artifact?path={frames_dir / 'nope.png'}")
+    assert response.status_code == 404
+
+
+def test_html_row_links_to_frame_artifact(tmp_path):
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    frame = frames_dir / "f.png"
+    frame.write_bytes(b"\x89PNG")
+    db_path = tmp_path / "x.sqlite"
+    with Storage(db_path) as s:
+        s.write({"timestamp": "2026-05-01T12:00:00+00:00", "lang": "ko",
+                 "text": "안녕", "confidence": 0.9, "bbox": [0, 0, 10, 10],
+                 "frame": str(frame)})
+    app = create_app(db_path, artifact_roots=[frames_dir])
+    app.config["TESTING"] = True
+    c = app.test_client()
+    response = c.get("/?q=%EC%95%88%EB%85%95")
+    assert b"/artifact?path=" in response.data
+    assert str(frame).encode("utf-8") in response.data
