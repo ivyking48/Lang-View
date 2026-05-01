@@ -62,3 +62,18 @@ def test_listener_exceptions_are_swallowed():
     s.add_listener(lambda _s: (_ for _ in ()).throw(RuntimeError("nope")))
     s.append({"lang": "ko", "text": "안녕"})  # Should not raise.
     assert len(s.recent()) == 1
+
+
+def test_state_works_with_file_pause_flag(tmp_path):
+    """MenubarState duck-types its pause source; FilePauseFlag has the
+    same is_paused()/toggle() shape as PauseSwitch and should plug in."""
+    from lang_view.pause import FilePauseFlag
+    flag = FilePauseFlag(tmp_path / "p.flag")
+    s = MenubarState(pause_switch=flag)
+    assert s.is_paused is False
+    s.toggle_pause()
+    assert s.is_paused is True
+    assert (tmp_path / "p.flag").exists()
+    s.toggle_pause()
+    assert s.is_paused is False
+    assert not (tmp_path / "p.flag").exists()

@@ -5,9 +5,12 @@ and the pause/running flag. `MenubarApp` is the thin rumps wrapper
 that wires the state to a menubar UI; it imports rumps lazily so
 this module stays importable on non-macOS systems.
 
-Wire the menubar to a running watch session by passing in a
-`PauseSwitch` (from `lang_view.worker`) and adding the
-`recent.append(...)` callback to your write path.
+Wire the menubar to a running watch session in two ways:
+- In-process: pass a ``PauseSwitch`` (from ``lang_view.worker``).
+- Cross-process (the always-on agent): pass a ``FilePauseFlag``
+  (from ``lang_view.pause``). The watch agent and the menubar
+  coordinate via the same flag file path, so the menubar can pause
+  the agent even though they live in different processes.
 """
 
 from __future__ import annotations
@@ -65,14 +68,27 @@ class MenubarState:
 
 
 class MenubarApp:
-    """rumps-based menubar UI bound to a MenubarState."""
+    """rumps-based menubar UI bound to a MenubarState.
 
-    def __init__(self, state, *, title="語Lang-View"):
+    The menubar title shows ``語`` when running and ``⏸ 語`` when paused,
+    so you can tell at a glance whether the agent is recording. A timer
+    polls the underlying pause source every ``poll_seconds`` so the
+    title updates even if the flag file is changed externally (e.g. by
+    a shell command).
+    """
+
+    def __init__(self, state, *, title_running="▶ 語", title_paused="⏸ 語",
+                 poll_seconds=2.0):
         self.state = state
-        self.title = title
+        self.title_running = title_running
+        self.title_paused = title_paused
+        self.poll_seconds = float(poll_seconds)
         self._app = None
         self._recent_items = []
         self._pause_item = None
+
+    def _title_for(self, state):
+        return self.title_paused if state.is_paused else self.title_running
 
     def run(self):
         try:
@@ -83,7 +99,7 @@ class MenubarApp:
                 "Install with `pip install lang-view[menubar]`."
             ) from e
 
-        app = rumps.App(self.title)
+        app = rumps.App(self._title_for(self.state))
         self._app = app
 
         pause_label = "Pause" if not self.state.is_paused else "Resume"
@@ -98,6 +114,15 @@ class MenubarApp:
         app.menu = [pause_item, None, recent_header, None, quit_item]
         self.state.add_listener(self._refresh)
         self._refresh(self.state)
+
+        # Poll the pause source so external changes (shell touch/rm of
+        # the flag file) flow back into the UI title.
+        try:
+            timer = rumps.Timer(self._on_tick, self.poll_seconds)
+            timer.start()
+        except Exception as e:
+            log.warning("Could not start refresh timer: %s", e)
+
         app.run()
 
     def _on_pause(self, _sender):
@@ -111,9 +136,13 @@ class MenubarApp:
         except ImportError:
             pass
 
+    def _on_tick(self, _sender):
+        self._refresh(self.state)
+
     def _refresh(self, state):
         if self._app is None:
             return
+        self._app.title = self._title_for(state)
         if self._pause_item is not None:
             self._pause_item.title = "Resume" if state.is_paused else "Pause"
         # Replace recent items: remove old ones, insert fresh.

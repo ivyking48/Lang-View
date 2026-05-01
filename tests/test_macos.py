@@ -28,6 +28,65 @@ def test_parse_applescript_handles_negative_coordinates():
     assert win.y == -50
 
 
+def test_parse_applescript_extracts_window_title():
+    win = parse_applescript_output(
+        "Google Chrome|0,25,1440,900|Perfect Crown | Disney+"
+    )
+    assert win.app == "Google Chrome"
+    assert win.title == "Perfect Crown | Disney+"
+
+
+def test_parse_applescript_title_without_geometry():
+    win = parse_applescript_output("Finder||Documents")
+    assert win.app == "Finder"
+    assert win.title == "Documents"
+    assert win.region == (0, 0, 0, 0)
+
+
+def test_parse_applescript_no_title_defaults_empty():
+    win = parse_applescript_output("Safari|10,20,800,600")
+    assert win.title == ""
+
+
+def test_get_visible_windows_returns_empty_without_quartz(monkeypatch):
+    """If pyobjc-framework-Quartz isn't installed (or import fails),
+    get_visible_windows should return an empty list, not raise."""
+    import builtins
+    real_import = builtins.__import__
+
+    def stub_import(name, *args, **kwargs):
+        if name.startswith("Quartz"):
+            raise ImportError("Quartz unavailable in test")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", stub_import)
+    from lang_view.macos import get_visible_windows
+    assert get_visible_windows() == []
+
+
+def test_active_window_area_property():
+    """ActiveWindow.area is used to pick the largest matching window."""
+    big = ActiveWindow(app="Chrome", x=0, y=0, w=1440, h=900)
+    small = ActiveWindow(app="Chrome", x=0, y=0, w=300, h=200)
+    assert big.area > small.area
+    assert ActiveWindow(app="x", x=0, y=0, w=0, h=0).area == 0
+
+
+def test_capture_window_image_returns_none_without_quartz(monkeypatch):
+    """capture_window_image must degrade gracefully when Quartz is absent."""
+    import builtins
+    real_import = builtins.__import__
+
+    def stub_import(name, *args, **kwargs):
+        if name.startswith("Quartz"):
+            raise ImportError("Quartz unavailable in test")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", stub_import)
+    from lang_view.macos import capture_window_image
+    assert capture_window_image(12345) is None
+
+
 def test_parse_applescript_returns_none_on_garbage():
     assert parse_applescript_output("") is None
 
