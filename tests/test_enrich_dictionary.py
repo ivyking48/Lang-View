@@ -125,3 +125,27 @@ def test_dictionary_enricher_applies_to_ja_and_ko():
 def test_dictionary_enricher_no_index_returns_empty():
     enricher = DictionaryEnricher(dict_dir="/tmp/nonexistent_lang_view_xyz_test")
     assert enricher.enrich("今日", "ja") == {}
+
+
+def test_lookup_token_returns_hits():
+    ja = JMdictIndex(SAMPLE_JMDICT["words"])
+    enricher = DictionaryEnricher(ja_index=ja)
+    hits = enricher.lookup_token("今日", "ja")
+    assert hits and "today" in hits[0]["meanings"]
+
+
+def test_lookup_token_misses_return_empty_list():
+    ja = JMdictIndex(SAMPLE_JMDICT["words"])
+    enricher = DictionaryEnricher(ja_index=ja)
+    assert enricher.lookup_token("xyz", "ja") == []
+
+
+def test_lookup_token_unknown_lang_returns_empty():
+    enricher = DictionaryEnricher(ja_index=JMdictIndex(SAMPLE_JMDICT["words"]))
+    assert enricher.lookup_token("anything", "en") == []
+
+
+def test_lookup_token_blank_returns_empty():
+    ja = JMdictIndex(SAMPLE_JMDICT["words"])
+    enricher = DictionaryEnricher(ja_index=ja)
+    assert enricher.lookup_token("", "ja") == []

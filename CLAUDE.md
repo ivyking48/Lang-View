@@ -22,6 +22,9 @@ Run the CLI:
 lang-view                                  # `watch` is the implicit default
 lang-view watch --db ~/lv.db --output ''   # disable JSONL with empty --output
 lang-view subtitle-watch --db ~/lv.db      # DOM scrape Disney+/Netflix via AppleScript
+lang-view subtitle-watch --overlay --enrich furigana,romaji,dict,translate \
+                         --bookmarks ~/lv-bookmarks.jsonl \
+                         --pause-flag-file ~/.local/share/lang-view/paused.flag
 lang-view search "안녕" --db ~/lv.db
 lang-view stats   --db ~/lv.db
 lang-view export  --db ~/lv.db --output out.csv  --format csv
@@ -40,7 +43,7 @@ lang-view keygen                           # Fernet key for --encrypt-key-env
 Tests (pytest, headless):
 
 ```
-pytest                          # whole suite — ~210 tests, runs in ~2s
+pytest                          # whole suite — ~250 tests, runs in ~2s
 pytest tests/test_storage.py    # one file
 pytest tests/test_storage.py::test_search_substring -v
 ```
@@ -79,10 +82,31 @@ osascript → tell app "Google Chrome" → execute t javascript "document.queryS
         → for each unique non-empty subtitle (last_text dedup, reset on blank)
         → text_filter.classify (fall back to --lang-hint)
         → _build_record (conf=1.0, app="Chrome")
+        → optional EnrichmentPipeline (furigana / romaji / romaja / dict / translate)
         → JSONL + Storage.write
+        → optional OverlayDriver.tick (push state, pop user action)
+                → toggle_pause flips FilePauseFlag
+                → save appends to bookmarks.jsonl
+                → lookup runs DictionaryEnricher.lookup_token, returned in next push
 ```
 
-Both pipelines respect the same `FilePauseFlag`. The menubar app touches/removes the flag file; both watchers poll it each cycle.
+Both pipelines respect the same `FilePauseFlag`. The menubar app touches/removes the flag file; both watchers poll it each cycle. With `--overlay`, the in-page HUD's Pause button drives the *same* flag file, so menubar/HUD/external `touch` are all equivalent.
+
+### Pipeline B.1: in-page overlay (`--overlay`)
+
+`lang_view/overlay.py` injects a singleton `<div id="lang-view-overlay">` into the same Chrome tab that `subtitle_scrape` reads from, via the same Apple Events JS bridge. Three JS payloads:
+
+- `bootstrap_js()` — idempotent installer. Re-evaluated every `rebootstrap_every` ticks (default 30) so SPA navigation in the player (next-episode auto-advance, profile switch) re-mounts the overlay on the new document.
+- `update_js(state)` — pushes a JSON state object: tokenized words (orig + reading + romaji), translation, paused flag, optional dictionary lookup result. JSON is embedded as a JS literal; AppleScript-quoting handles the outer string escape.
+- `pop_action_js()` — returns the pending user action as a JSON string, then clears it. Action shapes: `{type:"toggle_pause"}`, `{type:"save"}`, `{type:"lookup", word}`.
+
+Translation- and reading-visibility toggles stay client-side (CSS data-attribute flips on the root) to avoid a 2× osascript round trip per click. Only state-changing buttons (pause / save) and dictionary lookups round-trip to Python.
+
+The overlay's container is `position:fixed; bottom:14vh; z-index:2147483647`, sandbox-styled with `lang-view-*` IDs. `pointer-events:auto` only on the container itself; the `<video>` underneath stays clickable for play/pause/seek through the negative space around the HUD.
+
+### Why overlay is in-page (not a native NSWindow)
+
+A native transparent NSWindow over the Chrome process would work everywhere but introduces three problems we don't want: (a) it needs Accessibility permission to track Chrome's window geometry through Spaces and full-screen, (b) tracking the player's bottom-center under macOS's full-screen animation is racy, and (c) click-through carve-outs require window-level event hit-testing. The DOM overlay piggybacks on the Apple Events JS bridge that subtitle-watch already needs, so it costs zero new permissions and follows the player's geometry for free (the player resizes the DOM, we re-read its bounding box).
 
 ### Why two pipelines
 
@@ -97,6 +121,9 @@ macOS HDCP/Widevine enforcement substitutes blanked pixels at the compositor lev
 - **Storage is cross-thread.** SQLite connection uses `check_same_thread=False`. The watch loop creates `Storage` on the main thread and the OCR worker writes from a background thread; SQLite serialises writes via the connection lock, which is fine because there is exactly one writer process.
 - **Search uses `LIKE`, not FTS5.** The default FTS5 tokenizer fails on CJK because there is no whitespace — see the docstring on `Storage.search`. If you're tempted to add FTS5 back, you need a CJK tokenizer (icu/jieba/etc.), not a config tweak.
 - **Encryption is a per-line envelope.** When `--encrypt-key-env LV_KEY` is set, JSONL lines become `{"v":1,"ct":"<fernet>"}`. `_iter_jsonl` transparently decrypts when a cipher is supplied. SQLite rows are stored in cleartext — encrypt the disk if that matters.
+- **Overlay actions are sourced through the JS bridge, never out-of-band.** The overlay never opens a socket or a side channel back to Python. Every user click sets `pendingAction` in-page; Python pops it via `JSON.stringify(window.__langView.popAction() || null)` on the next tick. This keeps the trust boundary identical to the existing `subtitle-watch` permission model — if Chrome's "Allow JavaScript from Apple Events" is granted, both reads and writes go through it; if not, neither side works.
+- **Overlay bookmarks live in their own JSONL, not in `Storage`.** Save action appends the *current* capture record to `--bookmarks` and flushes. Storage stays append-only and bookmark-agnostic; if you later add a bookmarks view to the dashboard, read from the JSONL — don't mutate captures.
+- **Overlay tokenization shares the kakasi/transliter instances with the enrichers.** `KanaEnricher` and the overlay's per-word splitter both want pykakasi loaded; we instantiate one of each in `cmd_subtitle_watch` and pass them into both code paths. Don't construct a second kakasi — the dictionary load alone is ~150 ms.
 
 ### Engines
 
@@ -143,6 +170,8 @@ Two prerequisites — both surfaced via `chrome-permission-test`:
 1. **Chrome:** `View → Developer → Allow JavaScript from Apple Events` (one-time toggle).
 2. **macOS:** Automation grant for `ai.lang-view → Google Chrome`. Provoked by running `chrome-permission-test` once via the bundle (`open -a Lang-View --args chrome-permission-test`). The first request from the foreground bundle pops the dialog; user accepts; later launchd-spawned bundles inherit the grant.
 
+`lang_view/overlay.py` reuses the *same* bridge — it just runs `execute t javascript` for write operations (DOM injection, state updates) instead of read operations. No new permissions; the same Apple Events grant covers both directions.
+
 ### Dashboard
 
 `lang_view/dashboard.py` is a tiny Flask read-only UI. It opens a fresh `Storage` per request so a concurrent `watch` process can keep writing while you browse. Don't share a Storage handle across requests — SQLite + threads will bite.
@@ -164,6 +193,7 @@ The `/artifact?path=...` route serves snippet/frame PNGs but only if the resolve
 | `kCGWindowName` (window titles) | Screen Recording | Often blank for windows owned by other apps in launchd context. |
 | `--active-window` | Quartz (no Accessibility needed) | Falls back to osascript only if Quartz import fails — install `pyobjc-framework-Quartz`. |
 | `subtitle-watch` (osascript JS injection) | Chrome's "Allow JS from Apple Events" + macOS Automation grant | Both steps required; `chrome-permission-test` provokes the prompt. |
+| `subtitle-watch --overlay` (in-page HUD) | Same as above | Reuses the same Apple Events grant — no extra permissions. |
 
 ## Project context (parent workspace)
 

@@ -160,6 +160,21 @@ class DictionaryEnricher:
     def applies_to(self, lang):
         return lang in ("ja", "ko")
 
+    def lookup_token(self, token, lang, *, limit=3):
+        """Per-token lookup for callers that already tokenized the text.
+
+        Returns the same shape as the per-surface dict entries — i.e. a
+        list of ``{kanji, kana, meanings}`` (ja) or ``{reading, meanings}``
+        (ko). Used by the in-page overlay's click-to-define popup; the
+        overlay tokenizes once for display and re-using that tokenization
+        is cheaper than running the whole enricher for one word.
+        """
+        self._ensure_loaded()
+        index = self._ja if lang == "ja" else self._ko if lang == "ko" else None
+        if index is None or not token:
+            return []
+        return index.lookup(token, limit=limit)
+
     def enrich(self, text, lang):
         self._ensure_loaded()
         index = self._ja if lang == "ja" else self._ko

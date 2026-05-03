@@ -597,6 +597,20 @@ def cmd_install_subtitle_agent(args):
         program_args += ["--lang-hint", args.lang_hint]
     if args.pause_flag_file:
         program_args += ["--pause-flag-file", str(args.pause_flag_file)]
+    if getattr(args, "enrich", ""):
+        program_args += ["--enrich", args.enrich]
+    if getattr(args, "translator", "none") not in ("none", None):
+        program_args += ["--translator", args.translator]
+    if getattr(args, "translate_to", "en") and args.translate_to != "en":
+        program_args += ["--translate-to", args.translate_to]
+    if getattr(args, "translator_key_env", None):
+        program_args += ["--translator-key-env", args.translator_key_env]
+    if getattr(args, "dict_dir", None):
+        program_args += ["--dict-dir", str(args.dict_dir)]
+    if getattr(args, "overlay", False):
+        program_args += ["--overlay"]
+    if getattr(args, "bookmarks", None):
+        program_args += ["--bookmarks", str(args.bookmarks)]
     if args.verbose:
         program_args += ["--verbose"]
     raw = render_plist(
@@ -741,6 +755,13 @@ def cmd_subtitle_watch(args):
     AppleScript ``execute javascript`` bridge. ``--pause-flag-file``
     lets the menubar's existing toggle pause this loop the same way it
     pauses the OCR ``watch`` loop.
+
+    With ``--overlay`` we additionally inject an in-page HUD that shows
+    the live subtitle, optional reading hints (furigana / romaja), an
+    inline translation, and pause / save / lookup buttons. Click a word
+    in the overlay to get a dictionary popup. The overlay shares the
+    pause-flag file with the watch loop and the menubar, and writes
+    saved subtitles to ``--bookmarks``.
     """
     from .subtitle_scrape import is_osascript_available, scrape_chrome_subtitle
 
@@ -764,47 +785,158 @@ def cmd_subtitle_watch(args):
         from .pause import FilePauseFlag
         file_pause = FilePauseFlag(args.pause_flag_file)
 
-    log.info("Subtitle-watch: url=%r selector=%r interval=%.2fs",
-             args.url_match, args.selector, args.interval)
+    pipeline = None
+    if args.enrich:
+        from .enrich import build_pipeline
+        pipeline = build_pipeline(
+            args.enrich,
+            dict_dir=args.dict_dir,
+            translator_name=args.translator,
+            translate_to=args.translate_to,
+            api_key_env=args.translator_key_env,
+        )
+        log.info("Subtitle-watch enrichers: %s",
+                 ", ".join(getattr(e, "name", type(e).__name__)
+                           for e in pipeline.enrichers) or "(none)")
+
+    overlay = None
+    overlay_kakasi = None
+    overlay_transliter = None
+    overlay_dict = None
+    bookmarks_file = None
+    build_state = None
+    if args.overlay:
+        from .overlay import OverlayDriver, build_state as _build_state
+        build_state = _build_state
+        overlay = OverlayDriver(args.url_match)
+        try:
+            import pykakasi
+            overlay_kakasi = pykakasi.kakasi()
+        except ImportError:
+            log.info("pykakasi not installed; overlay reading hints disabled "
+                     "for Japanese (pip install 'lang-view[kana]').")
+        try:
+            from hangul_romanize import Transliter
+            from hangul_romanize.rule import academic
+            overlay_transliter = Transliter(academic)
+        except ImportError:
+            log.info("hangul-romanize not installed; overlay romaja disabled "
+                     "for Korean (pip install 'lang-view[romaja]').")
+        from .enrich.dictionary import DictionaryEnricher
+        overlay_dict = DictionaryEnricher(dict_dir=args.dict_dir)
+        if args.bookmarks:
+            args.bookmarks.parent.mkdir(parents=True, exist_ok=True)
+            bookmarks_file = args.bookmarks.open("a", encoding="utf-8")
+
+    log.info("Subtitle-watch: url=%r selector=%r interval=%.2fs overlay=%s",
+             args.url_match, args.selector, args.interval, bool(overlay))
     log.info("Chrome must have View > Developer > Allow JavaScript from "
              "Apple Events enabled.")
 
     last_text = ""
+    last_record = None
+    last_lang = args.lang_hint
+    pending_lookup = None
     try:
         while True:
-            if file_pause is not None and file_pause.is_paused():
-                time.sleep(args.interval)
-                continue
-            text = scrape_chrome_subtitle(args.url_match, args.selector)
+            paused = file_pause is not None and file_pause.is_paused()
+            text = None if paused else scrape_chrome_subtitle(args.url_match, args.selector)
+
             if not text:
                 last_text = ""  # reset so a re-appearing cue can re-fire
-                time.sleep(args.interval)
-                continue
-            if text == last_text:
-                time.sleep(args.interval)
-                continue
-            last_text = text
-            lang = classify(text, args.lang_hint) or args.lang_hint
-            record = {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "lang": lang,
-                "text": text,
-                "confidence": 1.0,
-                "bbox": [0, 0, 0, 0],
-                "app": "Chrome",
-            }
-            if out_file is not None:
-                out_file.write(json.dumps(record, ensure_ascii=False) + "\n")
-                out_file.flush()
-            if storage is not None:
-                storage.write(record)
-            log.info("[%s] %s", lang, text.replace("\n", " | "))
+            elif text != last_text:
+                last_text = text
+                lang = classify(text, args.lang_hint) or args.lang_hint
+                last_lang = lang
+                record = {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "lang": lang,
+                    "text": text,
+                    "confidence": 1.0,
+                    "bbox": [0, 0, 0, 0],
+                    "app": "Chrome",
+                }
+                if pipeline is not None:
+                    enrichment = pipeline.enrich(text, lang)
+                    if enrichment:
+                        record["enrichment"] = enrichment
+                if out_file is not None:
+                    out_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    out_file.flush()
+                if storage is not None:
+                    storage.write(record)
+                last_record = record
+                log.info("[%s] %s", lang, text.replace("\n", " | "))
+
+            if overlay is not None:
+                state = build_state(
+                    last_text or "",
+                    last_lang,
+                    enrichment=(last_record or {}).get("enrichment"),
+                    paused=paused,
+                    kakasi=overlay_kakasi,
+                    transliter=overlay_transliter,
+                    lookup=pending_lookup,
+                )
+                pending_lookup = None
+                action = overlay.tick(state)
+                if action:
+                    pending_lookup = _handle_overlay_action(
+                        action, last_record, last_lang,
+                        file_pause=file_pause,
+                        dict_enricher=overlay_dict,
+                        bookmarks_file=bookmarks_file,
+                    )
             time.sleep(args.interval)
     finally:
+        if overlay is not None:
+            try:
+                overlay.teardown()
+            except Exception as e:  # noqa: BLE001
+                log.debug("overlay teardown failed: %s", e)
+        if bookmarks_file is not None:
+            bookmarks_file.close()
         if out_file is not None:
             out_file.close()
         if storage is not None:
             storage.close()
+
+
+def _handle_overlay_action(action, last_record, last_lang, *,
+                           file_pause, dict_enricher, bookmarks_file):
+    """Apply one user-driven action from the overlay.
+
+    Returns a ``lookup`` dict to be attached to the *next* state push,
+    or None if no follow-up render is needed. Side effects (pause flip,
+    bookmark append) happen here so the watch loop stays linear.
+    """
+    kind = action.get("type")
+    if kind == "toggle_pause":
+        if file_pause is None:
+            log.info("overlay: pause requested but --pause-flag-file is unset")
+            return None
+        new_state = file_pause.toggle()
+        log.info("overlay: pause %s", "ON" if new_state else "OFF")
+        return None
+    if kind == "save":
+        if last_record is None:
+            log.info("overlay: save requested but no subtitle has been captured yet")
+            return None
+        if bookmarks_file is None:
+            log.info("overlay: save requested but --bookmarks is unset")
+            return None
+        bookmarks_file.write(json.dumps(last_record, ensure_ascii=False) + "\n")
+        bookmarks_file.flush()
+        log.info("overlay: bookmarked %r", last_record.get("text", ""))
+        return None
+    if kind == "lookup":
+        word = (action.get("word") or "").strip()
+        if not word or dict_enricher is None:
+            return None
+        hits = dict_enricher.lookup_token(word, last_lang)
+        return {"word": word, "hits": list(hits)}
+    log.debug("overlay: unknown action %r", action)
+    return None
 
 
 def cmd_menubar(args):
@@ -992,6 +1124,17 @@ def main(argv=None):
     inst_sub.add_argument("--interval", type=float, default=1.0)
     inst_sub.add_argument("--lang-hint", choices=("ko", "ja"), default="ko")
     inst_sub.add_argument("--pause-flag-file", type=Path, default=None)
+    inst_sub.add_argument("--enrich", default="",
+                          help="Same syntax as `subtitle-watch --enrich`.")
+    inst_sub.add_argument("--translator", default="none",
+                          choices=("none", "argos", "deepl", "openai"))
+    inst_sub.add_argument("--translate-to", default="en")
+    inst_sub.add_argument("--translator-key-env", default=None)
+    inst_sub.add_argument("--dict-dir", type=Path, default=None)
+    inst_sub.add_argument("--overlay", action="store_true",
+                          help="Inject the in-page HUD over the player.")
+    inst_sub.add_argument("--bookmarks", type=Path, default=None,
+                          help="JSONL path the overlay's Save button appends to.")
     inst_sub.add_argument("--verbose", "-v", action="store_true")
 
     uninst_sub = sub.add_parser("uninstall-subtitle-agent",
@@ -1049,6 +1192,28 @@ def main(argv=None):
                          "is ambiguous (e.g. CJK ideograph-only)")
     sw.add_argument("--pause-flag-file", type=Path, default=None,
                     help="Pause when this file exists (shared with the menubar)")
+    sw.add_argument("--enrich", default="",
+                    help="Comma-separated enrichers to run on each subtitle "
+                         "(furigana,romaji,romaja,dict,translate). Same syntax "
+                         "as `watch --enrich`.")
+    sw.add_argument("--translator", default="none",
+                    choices=("none", "argos", "deepl", "openai"))
+    sw.add_argument("--translate-to", default="en")
+    sw.add_argument("--translator-key-env", default=None,
+                    help="Env var holding the translator API key, if needed")
+    sw.add_argument("--dict-dir", type=Path, default=None,
+                    help="Directory holding dictionaries (jmdict-eng.json, "
+                         "kodict.tsv). Used for the overlay's click-to-define "
+                         "popup as well as the `dict` enricher.")
+    sw.add_argument("--overlay", action="store_true",
+                    help="Inject an in-page HUD over the player showing the "
+                         "live subtitle, reading hints, translation and quick "
+                         "action buttons. Requires the same Chrome Apple Events "
+                         "permission that subtitle-watch already needs.")
+    sw.add_argument("--bookmarks", type=Path, default=None,
+                    help="JSONL path to append saved subtitles to when the "
+                         "overlay's Save button is clicked. Storage stays "
+                         "append-only — bookmarks live in their own file.")
     sw.add_argument("--verbose", "-v", action="store_true")
 
     menubar = sub.add_parser("menubar",
