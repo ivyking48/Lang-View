@@ -1,12 +1,16 @@
 import os
 import plistlib
 import stat
+import subprocess
+from types import SimpleNamespace
 
 from lang_view.bundle import (
     DEFAULT_BUNDLE_ID,
     DEFAULT_BUNDLE_NAME,
     bundle_executable,
+    codesign_bundle,
     default_bundle_path,
+    lsregister_bundle,
     render_info_plist,
     render_launcher_script,
     write_app_bundle,
@@ -105,3 +109,61 @@ def test_bundle_executable_resolves_from_info_plist(tmp_path):
     exe = bundle_executable(bundle)
     assert exe.name == "my-launcher"
     assert exe.parent.name == "MacOS"
+
+
+def _ok(*_):
+    return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+
+def _fail(*_):
+    return SimpleNamespace(returncode=1, stdout="", stderr="boom")
+
+
+def test_codesign_bundle_invokes_adhoc_sign(tmp_path):
+    calls = []
+
+    def runner(cmd):
+        calls.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    bundle = tmp_path / "MyApp.app"
+    assert codesign_bundle(bundle, runner=runner) is True
+    # Ad-hoc signing uses "-" as the identity and must walk into
+    # the bundle (--deep) and overwrite any prior signature (--force).
+    assert calls == [["codesign", "--force", "--deep", "--sign", "-", str(bundle)]]
+
+
+def test_codesign_bundle_returns_false_on_failure(tmp_path):
+    bundle = tmp_path / "MyApp.app"
+    assert codesign_bundle(bundle, runner=_fail) is False
+
+
+def test_codesign_bundle_handles_missing_binary(tmp_path):
+    def runner(cmd):
+        raise FileNotFoundError("no codesign on PATH")
+
+    bundle = tmp_path / "MyApp.app"
+    assert codesign_bundle(bundle, runner=runner) is False
+
+
+def test_lsregister_bundle_uses_launch_services_helper(tmp_path):
+    calls = []
+
+    def runner(cmd):
+        calls.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    bundle = tmp_path / "MyApp.app"
+    assert lsregister_bundle(bundle, runner=runner) is True
+    assert len(calls) == 1
+    cmd = calls[0]
+    # lsregister lives inside the LaunchServices framework, not on PATH;
+    # passing the absolute path is what makes this work in launchd
+    # contexts where PATH is minimal.
+    assert cmd[0].endswith("/lsregister")
+    assert cmd[1:] == ["-f", str(bundle)]
+
+
+def test_lsregister_bundle_returns_false_on_failure(tmp_path):
+    bundle = tmp_path / "MyApp.app"
+    assert lsregister_bundle(bundle, runner=_fail) is False

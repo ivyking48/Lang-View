@@ -12,14 +12,20 @@ and inherits the bundle's TCC identity.
 
 The plist generator is pure and fully tested; ``write_app_bundle``
 shells out only insofar as it sets the executable bit on the launcher
-script (``chmod``, no subprocesses).
+script (``chmod``, no subprocesses). Ad-hoc signing and Launch Services
+registration are separate, best-effort helpers (``codesign_bundle``,
+``lsregister_bundle``) that the CLI runs after the bundle is written.
 """
 
 from __future__ import annotations
 
+import logging
 import plistlib
 import stat
+import subprocess
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 DEFAULT_BUNDLE_ID = "ai.lang-view"
 DEFAULT_BUNDLE_NAME = "Lang-View"
@@ -126,6 +132,63 @@ def write_app_bundle(
     (contents / "PkgInfo").write_text("APPL????")
 
     return dest
+
+
+_LSREGISTER = (
+    "/System/Library/Frameworks/CoreServices.framework"
+    "/Frameworks/LaunchServices.framework/Support/lsregister"
+)
+
+
+def _default_runner(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
+
+
+def codesign_bundle(dest, *, runner=None) -> bool:
+    """Ad-hoc sign the bundle so its TCC identity is pinned to a code hash.
+
+    Without a signature, macOS may invalidate granted permissions when
+    files inside the bundle change — the whole point of the bundle is
+    a stable identity, so signing is what makes it stable.
+
+    Best-effort: returns True on success, False (with a logged warning)
+    on failure. Tests inject ``runner`` to avoid shelling out.
+    """
+    runner = runner or _default_runner
+    cmd = ["codesign", "--force", "--deep", "--sign", "-", str(dest)]
+    try:
+        result = runner(cmd)
+    except (FileNotFoundError, subprocess.SubprocessError) as e:
+        log.warning("codesign not available or failed to launch: %s", e)
+        return False
+    if result.returncode != 0:
+        log.warning("codesign failed (rc=%d): %s",
+                    result.returncode, (result.stderr or result.stdout or "").strip())
+        return False
+    return True
+
+
+def lsregister_bundle(dest, *, runner=None) -> bool:
+    """Register the bundle with Launch Services so ``open -a`` finds it.
+
+    Without registration, ``open -a "Lang-View"`` may fail to resolve the
+    bundle, which the ``chrome-permission-test`` flow relies on to
+    provoke macOS Automation prompts from the bundle's identity.
+
+    Best-effort: returns True on success, False on failure.
+    """
+    runner = runner or _default_runner
+    cmd = [_LSREGISTER, "-f", str(dest)]
+    try:
+        result = runner(cmd)
+    except (FileNotFoundError, subprocess.SubprocessError) as e:
+        log.warning("lsregister not available or failed to launch: %s", e)
+        return False
+    if result.returncode != 0:
+        log.warning("lsregister failed (rc=%d): %s",
+                    result.returncode, (result.stderr or result.stdout or "").strip())
+        return False
+    return True
 
 
 def default_bundle_path(name: str = DEFAULT_BUNDLE_NAME) -> Path:

@@ -460,7 +460,9 @@ def cmd_package_app(args):
     from .bundle import (
         DEFAULT_BUNDLE_ID,
         DEFAULT_BUNDLE_NAME,
+        codesign_bundle,
         default_bundle_path,
+        lsregister_bundle,
         write_app_bundle,
     )
     dest = args.dest or default_bundle_path(args.bundle_name)
@@ -472,6 +474,10 @@ def cmd_package_app(args):
         lsui_element=not args.foreground,
     )
     log.info("Wrote .app bundle to %s", dest)
+    if codesign_bundle(dest):
+        log.info("Ad-hoc signed %s.", dest.name)
+    if lsregister_bundle(dest):
+        log.info("Registered %s with Launch Services.", dest.name)
     log.info("Next: grant Screen Recording to %s in", dest.name)
     log.info("System Settings > Privacy & Security > Screen Recording.")
 
